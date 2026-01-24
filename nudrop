@@ -1,0 +1,245 @@
+#!/usr/bin/env nu
+
+# nudrop: Window Manager for Niri
+# Usage: nudrop [flags] <command> [args...]
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+const MAPPING_FILE = "~/.config/nudrop/mappings.json"
+const CONNECTIVITY_URL = "https://1.1.1.1" 
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def is_debug [] {
+    $env.NUDROP_DEBUG? == "1" or $env.NUDROP_DEBUG? == "true"
+}
+
+def log [message: string] {
+    if (is_debug) {
+        print --stderr $"(ansi grey)[nudrop] ($message)(ansi reset)"
+    }
+}
+
+def notify_err [title: string, body: string] {
+    print --stderr $"(ansi red_bold)($title)(ansi reset): ($body)"
+    do -i { ^notify-send $title $body }
+}
+
+def wait_for_online [timeout: duration = 60sec] {
+    let start = (date now)
+    let deadline = ($start + $timeout)
+    
+    # FIX: Changed (Timeout: ...) to [Timeout: ...] to avoid running "Timeout:" as a command
+    print --stderr $"(ansi yellow)Checking internet connectivity [Timeout: ($timeout)]...(ansi reset)"
+    
+    loop {
+        if (date now) > $deadline { return false }
+        
+        # 'http head' checks connectivity. 
+        # We assume success if it returns without error.
+        if (try { http head --max-time 1sec $CONNECTIVITY_URL; true } catch { false }) {
+            return true
+        }
+        sleep 500ms
+    }
+    return false
+}
+
+def load_mappings [] {
+    let path = ($MAPPING_FILE | path expand)
+    if ($path | path exists) {
+        try { open $path } catch { {} }
+    } else {
+        {}
+    }
+}
+
+def save_mapping [cmd: string, app_id: string] {
+    let path = ($MAPPING_FILE | path expand)
+    let dir = ($path | path dirname)
+    if not ($dir | path exists) { mkdir $dir }
+    
+    load_mappings | upsert $cmd $app_id | save --force $path
+    log $"Learned mapping: ($cmd) -> ($app_id)"
+}
+
+def get_active_workspace [] {
+    try {
+        ^niri msg --json workspaces 
+        | from json 
+        | where is_focused == true 
+        | first 1 | get 0? | get id?
+    } catch { null }
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def --wrapped main [
+    --class (-c): string    
+    --app-id (-a): string   
+    --scratchpad (-s)       
+    --insensitive (-i)      
+    --online (-o)           
+    ...args: string         
+] {
+    if ($args | is-empty) {
+        print "Usage: nudrop [flags] <command> [args...]"
+        exit 1
+    }
+
+    let cmd_binary = ($args | first)
+    let cmd_rest = ($args | skip 1)
+    let mappings = (load_mappings)
+    
+    # Track source of ID to prevent bad overwrites
+    mut is_hardcoded = false
+
+    # 1. Determine Target App ID
+    let target_app_id = if ($class | is-not-empty) {
+        $class
+    } else if ($app_id | is-not-empty) {
+        $app_id
+    } else if ($cmd_binary in $mappings) {
+        $mappings | get $cmd_binary
+    } else {
+        # Hardcoded dictionary
+        let defaults = {
+            "code": "code-url-handler",
+            "godot4": "org.godotengine.Godot",
+            "epiphany": "org.gnome.Epiphany",
+            "brave": "brave-browser",
+            "google-chrome-stable": "google-chrome",
+            "tor-browser": "Tor Browser",
+            "telegram-desktop": "org.telegram.desktop",
+            "secrets": "org.gnome.World.Secrets",
+            "spotify": "Spotify",
+            "obs": "com.obsproject.Studio",
+            "nautilus": "org.gnome.Nautilus",
+            "gnome-calculator": "org.gnome.Calculator",
+            "foot": "foot"
+        }
+        
+        if ($cmd_binary in $defaults) {
+            $is_hardcoded = true
+            $defaults | get $cmd_binary
+        } else {
+            # Fallback: assume binary name is app_id
+            $cmd_binary
+        }
+    }
+
+    # FIX: Changed (Hardcoded: ...) to [Hardcoded: ...]
+    if (is_debug) { log $"Target: '($target_app_id)' [Hardcoded: ($is_hardcoded)]" }
+
+    # 2. Check Existing Windows
+    let windows = (try { ^niri msg --json windows | from json } catch { [] })
+    let active_ws_id = (get_active_workspace)
+
+    let target_window = ($windows | where {|w|
+        if ($w.app_id == null) { return false }
+        if $insensitive {
+            ($w.app_id | str downcase) == ($target_app_id | str downcase)
+        } else {
+            $w.app_id == $target_app_id
+        }
+    } | first 1 | get 0?)
+
+    # 3. Logic Branch
+    if ($target_window == null) {
+        # --- CASE A: LAUNCH ---
+        log $"App '($target_app_id)' not found. Launching..."
+
+        # Explicit Online Check
+        if $online {
+             if not (wait_for_online) { 
+                 notify_err "Network Error" $"Aborted ($cmd_binary): Timed out waiting for internet."
+                 exit 1 
+             }
+        }
+
+        let pre_launch_ids = ($windows.id)
+
+        # Build args
+        mut arg_builder = []
+        if ($class | is-not-empty) { $arg_builder = ($arg_builder | append ["--class", $class]) }
+        if ($app_id | is-not-empty) { $arg_builder = ($arg_builder | append ["--app-id", $app_id]) }
+        $arg_builder = ($arg_builder | append $cmd_rest)
+
+        try {
+            ^setsid -f $cmd_binary ...$arg_builder out> /dev/null err> /dev/null
+        } catch {
+            notify_err "Launch Error" $"Failed to execute: ($cmd_binary)"
+            exit 1
+        }
+
+        # --- Learning Loop ---
+        # Sleep briefly to let transient terminal windows/launchers settle
+        sleep 500ms 
+        
+        mut found_new_window = null
+        
+        # Poll for 10 seconds (20 * 500ms)
+        for _ in 1..20 {
+            sleep 500ms
+            let current_windows = (try { ^niri msg --json windows | from json } catch { [] })
+            
+            let new_win = ($current_windows 
+                | where {|w| $w.id not-in $pre_launch_ids } 
+                | first 1 
+                | get 0?)
+            
+            if ($new_win != null) {
+                $found_new_window = $new_win
+                break
+            }
+        }
+
+        if ($found_new_window != null) {
+            # Freeze mutable variable for closure usage
+            let final_win = $found_new_window
+            let detected_id = $final_win.app_id
+            
+            # SAFEGUARD: Only learn if we didn't have a hardcoded match.
+            # This prevents overwriting 'brave-browser' with 'foot_hx'.
+            if ($detected_id != $target_app_id) and ($class | is-empty) and ($app_id | is-empty) {
+                if not $is_hardcoded {
+                    log $"Mismatch detected. Learning: ($cmd_binary) -> ($detected_id)"
+                    save_mapping $cmd_binary $detected_id
+                } else {
+                    # FIX: Changed (Expected: ...) to [Expected: ...]
+                    log $"Mismatch ignored due to hardcoded default. [Expected: ($target_app_id), Got: ($detected_id)]"
+                }
+            }
+
+            # Uses the frozen 'final_win' variable, which is allowed in 'do' blocks
+            do -i { ^niri msg action focus-window --id $final_win.id }
+        } else {
+            # Only warn if not in debug, so user knows why nothing happened
+            if not (is_debug) { print --stderr $"(ansi yellow)[nudrop] Launched ($cmd_binary) but no window appeared within timeout.(ansi reset)" }
+        }
+
+    } else {
+        # --- CASE B: FOCUS/TOGGLE ---
+        let win_id = $target_window.id
+        
+        # Handle Scratchpad / Focus logic
+        if ($active_ws_id != null) and ($target_window.workspace_id == $active_ws_id) {
+            if $scratchpad {
+                do -i { ^niri msg action move-window-to-workspace --window-id $win_id "ndrop-hidden" }
+            } else {
+                do -i { ^niri msg action focus-window --id $win_id }
+            }
+        } else {
+            if ($active_ws_id != null) {
+                 do -i { ^niri msg action move-window-to-workspace --window-id $win_id $active_ws_id }
+            }
+            do -i { ^niri msg action focus-window --id $win_id }
+        }
+    }
+}
