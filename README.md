@@ -37,7 +37,7 @@ This nushell script emulates the main features of [tdrop](https://github.com/noc
 Multiple instances of the same program can be run concurrently, if different class names are assigned to each instance. Presently, there is support for the following flags in the [COMMAND] string:
 
 > `-a` | `--app-id` ([foot](https://codeberg.org/dnkl/foot/) terminal emulator)  
-> `--class` (all other programs)
+> `-c` | `--class` (all other programs)
 
 #### Example bindings in niri config:
 

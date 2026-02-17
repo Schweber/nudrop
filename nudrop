@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------
 
 const MAPPING_FILE = "~/.config/nudrop/mappings.json"
-const CONNECTIVITY_URL = "https://1.1.1.1" 
+const CONNECTIVITY_URL = "http://connectivitycheck.gstatic.com/generate_204"
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -33,20 +33,23 @@ def wait_for_online [timeout: duration = 60sec] {
     let start = (date now)
     let deadline = ($start + $timeout)
     
-    # FIX: Changed (Timeout: ...) to [Timeout: ...] to avoid running "Timeout:" as a command
     print --stderr $"(ansi yellow)Checking internet connectivity [Timeout: ($timeout)]...(ansi reset)"
     
     loop {
         if (date now) > $deadline { return false }
         
-        # 'http head' checks connectivity. 
-        # We assume success if it returns without error.
-        if (try { http head --max-time 1sec $CONNECTIVITY_URL; true } catch { false }) {
+        let response = (try { 
+            http get --full --max-time 2sec $CONNECTIVITY_URL 
+        } catch { 
+            null 
+        })
+
+        if ($response != null) and ($response.status == 204) {
             return true
         }
+        
         sleep 500ms
     }
-    return false
 }
 
 def load_mappings [] {
@@ -134,7 +137,6 @@ def --wrapped main [
         }
     }
 
-    # FIX: Changed (Hardcoded: ...) to [Hardcoded: ...]
     if (is_debug) { log $"Target: '($target_app_id)' [Hardcoded: ($is_hardcoded)]" }
 
     # 2. Check Existing Windows
@@ -179,7 +181,6 @@ def --wrapped main [
         }
 
         # --- Learning Loop ---
-        # Sleep briefly to let transient terminal windows/launchers settle
         sleep 500ms 
         
         mut found_new_window = null
@@ -201,26 +202,20 @@ def --wrapped main [
         }
 
         if ($found_new_window != null) {
-            # Freeze mutable variable for closure usage
             let final_win = $found_new_window
             let detected_id = $final_win.app_id
             
-            # SAFEGUARD: Only learn if we didn't have a hardcoded match.
-            # This prevents overwriting 'brave-browser' with 'foot_hx'.
             if ($detected_id != $target_app_id) and ($class | is-empty) and ($app_id | is-empty) {
                 if not $is_hardcoded {
                     log $"Mismatch detected. Learning: ($cmd_binary) -> ($detected_id)"
                     save_mapping $cmd_binary $detected_id
                 } else {
-                    # FIX: Changed (Expected: ...) to [Expected: ...]
                     log $"Mismatch ignored due to hardcoded default. [Expected: ($target_app_id), Got: ($detected_id)]"
                 }
             }
 
-            # Uses the frozen 'final_win' variable, which is allowed in 'do' blocks
             do -i { ^niri msg action focus-window --id $final_win.id }
         } else {
-            # Only warn if not in debug, so user knows why nothing happened
             if not (is_debug) { print --stderr $"(ansi yellow)[nudrop] Launched ($cmd_binary) but no window appeared within timeout.(ansi reset)" }
         }
 
@@ -228,7 +223,6 @@ def --wrapped main [
         # --- CASE B: FOCUS/TOGGLE ---
         let win_id = $target_window.id
         
-        # Handle Scratchpad / Focus logic
         if ($active_ws_id != null) and ($target_window.workspace_id == $active_ws_id) {
             if $scratchpad {
                 do -i { ^niri msg action move-window-to-workspace --window-id $win_id "ndrop-hidden" }
